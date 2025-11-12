@@ -1,2 +1,14 @@
-.venv/
-.claude/
+# Blender project files
+*.blend
+*.blend*
+
+# Generated geometry exports
+*.stl
+*.obj
+
+# Input GDS
+*.gds
+
+# Python build artefacts
+__pycache__/
+*.pyc

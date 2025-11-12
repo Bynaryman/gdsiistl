@@ -4,8 +4,8 @@ This program converts a GDSII 2D layout file to multiple 3D STL files that can
 be visualized in an external program (e.g., Blender).
 
 USAGE:
-    - edit the "layerstack" variable in the "CONFIGURATION" section below
-    - run "gdsiistl file.gds"
+    - optionally pick a height scheme with "--height-scheme flat|sky130"
+    - run "gdsiistl.py file.gds"
 OUTPUT:
     - the files file.gds_layername1.stl, file.gds_layername2.stl, ...
 
@@ -17,47 +17,172 @@ All units, including the units of the exported file, are the GDSII file's
 user units (often microns).
 """
 
-import sys # read command-line arguments
+import argparse # parse command-line options
+import sys # handle unexpected errors
 import gdspy # open gds file
 from stl import mesh # write stl file (python package name is "numpy-stl")
 import numpy as np # fast math on lots of points
 import triangle # triangulate polygons
 
-# get the input file name
-if len(sys.argv) < 2: # sys.argv[0] is the name of the program
-    print("Error: need exactly one file as a command line argument.")
-    sys.exit(0)
-gdsii_file_path = sys.argv[1]
-
 ########## CONFIGURATION (EDIT THIS PART) #####################################
 
-# choose which GDSII layers to use
-layerstack = {
-    # (layernumber, datatype) : (zmin, zmax, 'layername'),
-    
-    (235,4): (0, 0.1, 'substrate'),
-
-    (64,20): (0, 0.1, 'nwell'),    
-    (65,44): (0, 0.1, 'tap'),    
-    (65,20): (0, 0.1, 'diff'),    
-    (66,20): (0, 0.1, 'poly'),    
-    (66,44): (0, 0.1, 'licon'),    
-    (67,20): (0, 0.1, 'li1'),    
-    (67,44): (0, 0.1, 'mcon'),    
-    (68,20): (0, 0.1, 'met1'),    
-    (68,44): (0, 0.1, 'via'),    
-    (69,20): (0, 0.1, 'met2'),    
-    (69,44): (0, 0.1, 'via2'),    
-    (70,20): (0, 0.1, 'met3'),    
-    (70,44): (0, 0.1, 'via3'),    
-    (71,20): (0, 0.1, 'met4'),    
-    (71,44): (0, 0.1, 'via4'),    
-    (72,20): (0, 0.1, 'met5'),
-    # (83,44): (0, 0.1, 'text'),
-
-
-
+# (layer, datatype) -> canonical SKY130 layer name
+LAYER_DEFINITIONS = {
+    (235, 4): 'substrate',
+    (64, 20): 'nwell',
+    (65, 44): 'tap',
+    (65, 20): 'diff',
+    (66, 20): 'poly',
+    (66, 44): 'licon',
+    (67, 20): 'li1',
+    (67, 44): 'mcon',
+    (68, 20): 'met1',
+    (68, 44): 'via',
+    (69, 20): 'met2',
+    (69, 44): 'via2',
+    (70, 20): 'met3',
+    (70, 44): 'via3',
+    (71, 20): 'met4',
+    (71, 44): 'via4',
+    (72, 20): 'met5',
+    # Uncomment the next line to extrude text labels as well.
+    # (83, 44): 'text',
 }
+
+# default (flat) height scheme
+HEIGHT_SCHEMES = {
+    'flat': {
+        'substrate': (-0.5, 0.0),
+        'nwell': (0.0, 0.2),
+        'tap': (0.0, 0.2),
+        'diff': (0.0, 0.2),
+        'poly': (0.2, 0.35),
+        'licon': (0.35, 0.45),
+        'li1': (0.45, 0.55),
+        'mcon': (0.55, 0.65),
+        'met1': (0.65, 0.75),
+        'via': (0.75, 0.85),
+        'met2': (0.85, 0.95),
+        'via2': (0.95, 1.05),
+        'met3': (1.05, 1.15),
+        'via3': (1.15, 1.25),
+        'met4': (1.25, 1.35),
+        'via4': (1.35, 1.45),
+        'met5': (1.45, 1.55),
+        'text': (1.6, 1.65),
+    }
+}
+
+
+def _build_sky130_height_scheme():
+    """Constructs z-bounds that follow the SKY130 process stack diagram."""
+    stack_sequence = [
+        ('fox', 0.3262),
+        ('psg', 0.6099),
+        ('li1', 0.1000),
+        ('nild2', 0.2650),
+        ('met1', 0.3600),
+        ('nild3', 0.2700),
+        ('met2', 0.3600),
+        ('nild4', 0.4200),
+        ('met3', 0.8450),
+        ('nild5', 0.3900),
+        ('met4', 0.8450),
+        ('nild6', 0.5050),
+        ('met5', 1.2600),
+        ('topnit', 0.3777),
+        ('cap', 0.0700),
+        ('topox', 0.0900),
+        ('glass', 0.1200),
+        ('polyimide', 5.2523),
+    ]
+    bounds = {}
+    current = 0.0
+    for name, thickness in stack_sequence:
+        bounds[name] = (current, current + thickness)
+        current += thickness
+
+    scheme = {
+        'substrate': (-1.0, 0.0),
+        'nwell': (-0.4, 0.05),
+        'tap': (0.0, 0.18),
+        'diff': (0.0, 0.18),
+        'poly': (bounds['fox'][1] - 0.18, bounds['fox'][1]),
+        'licon': (bounds['psg'][1] - 0.075, bounds['psg'][1]),
+        'li1': bounds['li1'],
+        'mcon': bounds['nild2'],
+        'met1': bounds['met1'],
+        'via': bounds['nild3'],
+        'met2': bounds['met2'],
+        'via2': bounds['nild4'],
+        'met3': bounds['met3'],
+        'via3': bounds['nild5'],
+        'met4': bounds['met4'],
+        'via4': bounds['nild6'],
+        'met5': bounds['met5'],
+        'text': (bounds['glass'][0], bounds['glass'][1]),
+    }
+    return scheme
+
+
+HEIGHT_SCHEMES['sky130'] = _build_sky130_height_scheme()
+
+
+def build_layerstack(height_scheme):
+    """Return the layerstack dict for the selected height scheme."""
+    chosen = HEIGHT_SCHEMES.get(height_scheme, HEIGHT_SCHEMES['flat'])
+    fallback = HEIGHT_SCHEMES['flat']
+    layerstack = {}
+    for key, name in LAYER_DEFINITIONS.items():
+        zmin, zmax = chosen.get(name, fallback.get(name, (0.0, 0.1)))
+        layerstack[key] = (zmin, zmax, name)
+    return layerstack
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Convert SkyWater SKY130 GDS layers to STL meshes."
+    )
+    parser.add_argument(
+        "gdsii_file_path",
+        help="Input GDSII file to convert."
+    )
+    parser.add_argument(
+        "--height-scheme",
+        choices=sorted(HEIGHT_SCHEMES.keys()),
+        default="flat",
+        help=(
+            "Select how z-bounds are assigned to each layer. "
+            "'flat' keeps all extrusions the same thickness. "
+            "'sky130' uses the published SKY130 stack-up values."
+        ),
+    )
+    return parser.parse_args()
+
+
+args = parse_arguments()
+gdsii_file_path = args.gdsii_file_path
+layerstack = build_layerstack(args.height_scheme)
+
+def sanitize_polygon(points, tol=1e-9):
+    """
+    Remove consecutive duplicate vertices (within tol) so triangle()
+    never sees zero-length edges that make it hang or segfault.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return pts, 0
+    cleaned = [pts[0]]
+    removed = 0
+    for vertex in pts[1:]:
+        if np.linalg.norm(vertex - cleaned[-1]) <= tol:
+            removed += 1
+            continue
+        cleaned.append(vertex)
+    if len(cleaned) > 2 and np.linalg.norm(cleaned[0] - cleaned[-1]) <= tol:
+        cleaned.pop()
+        removed += 1
+    return np.asarray(cleaned, dtype=float), removed
 
 
 
@@ -137,6 +262,7 @@ and third element is False (whether the polygon is clockwise; will be updated).
 print('Triangulating polygons...')
 
 num_triangles = {} # will store the number of triangles for each layer
+skipped_polygons = {} # track polygons we drop because they are degenerate
 
 # loop through all layers
 for layer_number, polygons in layers.items():
@@ -148,7 +274,15 @@ for layer_number, polygons in layers.items():
     num_triangles[layer_number] = 0
 
     # loop through polygons in layer
+    skipped_polygons.setdefault(layer_number, 0)
+
     for index, (polygon, _, _) in enumerate(polygons):
+
+        polygon = np.asarray(polygon, dtype=float)
+        polygon, _ = sanitize_polygon(polygon)
+        if len(polygon) < 3:
+            skipped_polygons[layer_number] += 1
+            continue
 
         num_polygon_points = len(polygon)
 
@@ -175,6 +309,8 @@ for layer_number, polygons in layers.items():
                               points_k[:, 0]-points_i[:, 0]), axis=1)
         length_ij = np.linalg.norm(normal_ij, axis=1)
         length_ik = np.linalg.norm(normal_ik, axis=1)
+        length_ij[length_ij == 0] = 1
+        length_ik[length_ik == 0] = 1
         normal_ij /= np.stack((length_ij, length_ij), axis=1)
         normal_ik /= np.stack((length_ik, length_ik), axis=1)
         if clockwise:
@@ -223,6 +359,13 @@ for layer_number, polygons in layers.items():
         num_triangles[layer_number] += num_polygon_points*2 + \
                                        len(triangles['triangles'])*2
         polygons[index] = (polygon, triangles, clockwise)
+
+total_skipped = sum(skipped_polygons.values())
+if total_skipped > 0:
+    print('Skipped {} degenerate polygon(s) with duplicated vertices:'.format(total_skipped))
+    for layer_key, count in sorted(skipped_polygons.items()):
+        if count:
+            print('    layer {}: {}'.format(layer_key, count))
 
 """
 At this point, "layers" is as follows:
