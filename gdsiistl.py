@@ -4,7 +4,8 @@ This program converts a GDSII 2D layout file to multiple 3D STL files that can
 be visualized in an external program (e.g., Blender).
 
 USAGE:
-    - optionally pick a height scheme with "--height-scheme flat|sky130"
+    - optionally pick a height scheme with "--height-scheme <name>"
+    - optionally provide a PDK config script with "--pdk-script path/to/pdk.py"
     - run "gdsiistl.py file.gds"
 OUTPUT:
     - the files file.gds_layername1.stl, file.gds_layername2.stl, ...
@@ -18,7 +19,9 @@ user units (often microns).
 """
 
 import argparse # parse command-line options
+import importlib.util # dynamically load optional PDK script
 import sys # handle unexpected errors
+from pathlib import Path # resolve PDK script paths
 import gdspy # open gds file
 from stl import mesh # write stl file (python package name is "numpy-stl")
 import numpy as np # fast math on lots of points
@@ -27,7 +30,7 @@ import triangle # triangulate polygons
 ########## CONFIGURATION (EDIT THIS PART) #####################################
 
 # (layer, datatype) -> canonical SKY130 layer name
-LAYER_DEFINITIONS = {
+DEFAULT_LAYER_DEFINITIONS = {
     (235, 4): 'substrate',
     (64, 20): 'nwell',
     (65, 44): 'tap',
@@ -50,7 +53,7 @@ LAYER_DEFINITIONS = {
 }
 
 # default (flat) height scheme
-HEIGHT_SCHEMES = {
+DEFAULT_HEIGHT_SCHEMES = {
     'flat': {
         'substrate': (-0.5, 0.0),
         'nwell': (0.0, 0.2),
@@ -125,44 +128,194 @@ def _build_sky130_height_scheme():
     return scheme
 
 
-HEIGHT_SCHEMES['sky130'] = _build_sky130_height_scheme()
+DEFAULT_HEIGHT_SCHEMES['sky130'] = _build_sky130_height_scheme()
 
 
-def build_layerstack(height_scheme):
+def build_layerstack(height_scheme, layer_definitions, height_schemes):
     """Return the layerstack dict for the selected height scheme."""
-    chosen = HEIGHT_SCHEMES.get(height_scheme, HEIGHT_SCHEMES['flat'])
-    fallback = HEIGHT_SCHEMES['flat']
+    chosen = height_schemes[height_scheme]
+    fallback = height_schemes.get('flat')
+    if fallback is None:
+        fallback = next(iter(height_schemes.values()))
     layerstack = {}
-    for key, name in LAYER_DEFINITIONS.items():
+    for key, name in layer_definitions.items():
         zmin, zmax = chosen.get(name, fallback.get(name, (0.0, 0.1)))
         layerstack[key] = (zmin, zmax, name)
     return layerstack
 
 
+def _validate_layer_definitions(layer_definitions, source_name):
+    if not isinstance(layer_definitions, dict) or not layer_definitions:
+        raise ValueError(
+            '{} must define non-empty LAYER_DEFINITIONS dictionary'.format(
+                source_name
+            )
+        )
+
+    normalized = {}
+    for layer_key, layer_name in layer_definitions.items():
+        if (
+            not isinstance(layer_key, tuple)
+            or len(layer_key) != 2
+            or not all(isinstance(value, int) for value in layer_key)
+        ):
+            raise ValueError(
+                '{} has invalid layer key {!r}; expected (layer, datatype) '
+                'integer tuple'.format(source_name, layer_key)
+            )
+        if not isinstance(layer_name, str) or not layer_name:
+            raise ValueError(
+                '{} has invalid layer name {!r}; expected non-empty string'
+                .format(source_name, layer_name)
+            )
+        normalized[(int(layer_key[0]), int(layer_key[1]))] = layer_name
+    return normalized
+
+
+def _validate_height_schemes(height_schemes, source_name):
+    if not isinstance(height_schemes, dict) or not height_schemes:
+        raise ValueError(
+            '{} must define at least one height scheme'.format(source_name)
+        )
+
+    normalized = {}
+    for scheme_name, scheme_layers in height_schemes.items():
+        if not isinstance(scheme_name, str) or not scheme_name:
+            raise ValueError(
+                '{} has invalid height scheme name {!r}'.format(
+                    source_name, scheme_name
+                )
+            )
+        if not isinstance(scheme_layers, dict):
+            raise ValueError(
+                '{} scheme {!r} must be a dictionary'.format(
+                    source_name, scheme_name
+                )
+            )
+
+        normalized_scheme = {}
+        for layer_name, bounds in scheme_layers.items():
+            if not isinstance(layer_name, str) or not layer_name:
+                raise ValueError(
+                    '{} scheme {!r} has invalid layer name {!r}'.format(
+                        source_name, scheme_name, layer_name
+                    )
+                )
+            if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
+                raise ValueError(
+                    '{} scheme {!r}, layer {!r}: expected (zmin, zmax) pair'
+                    .format(source_name, scheme_name, layer_name)
+                )
+            zmin = float(bounds[0])
+            zmax = float(bounds[1])
+            if zmax < zmin:
+                raise ValueError(
+                    '{} scheme {!r}, layer {!r}: zmax ({}) < zmin ({})'
+                    .format(source_name, scheme_name, layer_name, zmax, zmin)
+                )
+            normalized_scheme[layer_name] = (zmin, zmax)
+        normalized[scheme_name] = normalized_scheme
+    return normalized
+
+
+def _load_pdk_script(script_path):
+    script = Path(script_path).expanduser().resolve()
+    if not script.is_file():
+        raise FileNotFoundError('PDK script not found: {}'.format(script))
+
+    spec = importlib.util.spec_from_file_location('gdsiistl_user_pdk', script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('Failed to load PDK script: {}'.format(script))
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    layer_definitions = _validate_layer_definitions(
+        getattr(module, 'LAYER_DEFINITIONS', None),
+        str(script),
+    )
+    height_schemes = _validate_height_schemes(
+        getattr(module, 'HEIGHT_SCHEMES', None),
+        str(script),
+    )
+    default_height_scheme = getattr(module, 'DEFAULT_HEIGHT_SCHEME', None)
+    if default_height_scheme is None:
+        if 'flat' in height_schemes:
+            default_height_scheme = 'flat'
+        else:
+            default_height_scheme = sorted(height_schemes.keys())[0]
+    if default_height_scheme not in height_schemes:
+        raise ValueError(
+            '{} DEFAULT_HEIGHT_SCHEME={!r} is not one of: {}'.format(
+                script,
+                default_height_scheme,
+                ', '.join(sorted(height_schemes.keys())),
+            )
+        )
+
+    return layer_definitions, height_schemes, default_height_scheme, script
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Convert SkyWater SKY130 GDS layers to STL meshes."
+        description="Convert selected GDS layers to STL meshes."
     )
     parser.add_argument(
         "gdsii_file_path",
         help="Input GDSII file to convert."
     )
     parser.add_argument(
-        "--height-scheme",
-        choices=sorted(HEIGHT_SCHEMES.keys()),
-        default="flat",
+        "--pdk-script",
+        default=None,
         help=(
-            "Select how z-bounds are assigned to each layer. "
-            "'flat' keeps all extrusions the same thickness. "
-            "'sky130' uses the published SKY130 stack-up values."
+            "Optional Python file that defines LAYER_DEFINITIONS and "
+            "HEIGHT_SCHEMES. If provided, these replace the built-in SKY130 "
+            "mapping."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--height-scheme",
+        default=None,
+        help=(
+            "Height scheme name from the selected PDK config. If omitted, "
+            "the config default is used."
+        ),
+    )
+    return parser, parser.parse_args()
 
 
-args = parse_arguments()
+parser, args = parse_arguments()
 gdsii_file_path = args.gdsii_file_path
-layerstack = build_layerstack(args.height_scheme)
+if args.pdk_script:
+    try:
+        layer_definitions, height_schemes, default_height_scheme, pdk_script = (
+            _load_pdk_script(args.pdk_script)
+        )
+    except Exception as exc:
+        parser.error(str(exc))
+    print('Using PDK script {}'.format(pdk_script))
+else:
+    layer_definitions = dict(DEFAULT_LAYER_DEFINITIONS)
+    height_schemes = {
+        name: dict(bounds)
+        for name, bounds in DEFAULT_HEIGHT_SCHEMES.items()
+    }
+    default_height_scheme = 'flat'
+
+selected_height_scheme = args.height_scheme or default_height_scheme
+if selected_height_scheme not in height_schemes:
+    parser.error(
+        "Unknown --height-scheme {!r}. Available: {}".format(
+            selected_height_scheme,
+            ', '.join(sorted(height_schemes.keys())),
+        )
+    )
+
+layerstack = build_layerstack(
+    selected_height_scheme,
+    layer_definitions,
+    height_schemes,
+)
 
 def sanitize_polygon(points, tol=1e-9):
     """
